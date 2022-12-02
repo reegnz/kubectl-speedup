@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-set -x
 
 KUBE_PROXY_KUBECONFIG_DIR="${HOME}/.cache/kubectl-speedup"
 KUBE_PROXY_STATE="${KUBE_PROXY_KUBECONFIG_DIR}/state.json"
