@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -x
+
+KUBE_PROXY_KUBECONFIG_DIR="${HOME}/.cache/kubectl-speedup"
+KUBE_PROXY_STATE="${KUBE_PROXY_KUBECONFIG_DIR}/state.json"
+
+EFFECTIVE_KUBECONFIG=$(kubectl config view --minify -o json)
+KUBECONFIG_HASH=$(echo "${EFFECTIVE_KUBECONFIG}" | sha256sum | awk '{print $1}')
+
+
+__ensure_state_exists() {
+  if [ ! -f "${KUBE_PROXY_STATE}" ]; then
+    mkdir -p "$(dirname "${KUBE_PROXY_STATE}")"
+    jq -n '{proxies:[]}' | __write_state
+  fi
+}
+
+__read_state() {
+  __ensure_state_exists
+  cat "${KUBE_PROXY_STATE}"
+}
+
+__write_state() {
+  cat | jq '.' > "${KUBE_PROXY_STATE}.tmp"
+  mv "${KUBE_PROXY_STATE}.tmp" "${KUBE_PROXY_STATE}"
+}
+
+__find_free_port() {
+  local low_port=8000
+  local high_port=9000
+  for _ in {1..10}; do
+    local port="$((low_port + RANDOM % (high_port - low_port) ))"
+    if ! nc -z -w 0 localhost ${port}; then
+      echo "Found free port: $port" >&2
+      echo $port
+      return
+    fi
+  done
+}
+
+__generate_proxy_config() {
+  DERIVED_KUBECONFIG="${KUBE_PROXY_KUBECONFIG_DIR}/${pid}.json"
+	jq --arg port $2 'del(.users,.preferences)
+          |.clusters[0].cluster |= {server: "http://localhost:\($port)"}
+          |.contexts[0].context |= {cluster}' <<<"${EFFECTIVE_KUBECONFIG}" > "$DERIVED_KUBECONFIG"
+  jq -n \
+    --arg pid "${1}" \
+    --arg port "${2}" \
+    --arg kubeconfig_hash "${KUBECONFIG_HASH}" \
+    --arg derived_kubeconfig "${DERIVED_KUBECONFIG}" \
+    '{
+        port: $port,
+        pid: $pid,
+        kubeconfig_hash: $kubeconfig_hash,
+        derived_kubeconfig: $derived_kubeconfig,
+    }'
+}
+
+__start_proxy() {
+  port=$(__find_free_port)
+  command kubectl proxy --port "${port}" &>/dev/null &
+  pid=$!
+  proxy_config=$(__generate_proxy_config "${pid}" "${port}")
+  __read_state | 
+    jq --argjson proxy_config "${proxy_config}" '.proxies |= . + [$proxy_config]' |
+    __write_state
+  echo "${proxy_config}"
+}
+
+__find_proxy() {
+  proxy_config=$(__read_state | jq --arg kubeconfig_hash "$KUBECONFIG_HASH" '.proxies[]|select(.kubeconfig_hash == $kubeconfig_hash)')
+  if [ -z "${proxy_config}" ]; then
+    echo "kubectl proxy not found, starting..." >&2
+    return 1
+  fi
+  pid=$(jq -r '.pid' <<<"$proxy_config")
+  if ! kill -s 0 "${pid}"; then
+    echo "kubectl proxy not found, starting..." >&2
+    rm -rf "${KUBE_PROXY_KUBECONFIG_DIR}/${pid}.json"
+    __read_state | jq --arg kubeconfig_hash "$KUBECONFIG_HASH" '.proxies |= map(select(.kubeconfig_hash != $kubeconfig_hash))' | __write_state
+    return 1
+  fi
+  echo "${proxy_config}"
+
+}
+
+__ensure_proxy() {
+  if ! proxy_config=$(__find_proxy); then
+    proxy_config=$(__start_proxy)
+  fi
+  KUBECONFIG=$(jq -r '.derived_kubeconfig' <<<"${proxy_config}")
+  export KUBECONFIG
+}
+
+main() {
+  __ensure_proxy
+  kubectl "$@"
+}
+
+main "$@"
